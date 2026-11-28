@@ -15,7 +15,7 @@ TASK = "Mjlab-Velocity-Flat-XgoDuck-Scratch"
 VOLT_MIN = 7.0
 _P = json.loads(Path("src/mjlab_microduck/robot/xgoduck/params/1910_m6.json").read_text())
 V_LIM = 0.8 * VOLT_MIN / _P["kt"]
-if os.environ.get("SCR_STAGE") in ("F", "G", "H"):   # 11-27 user: push 1 m/s -> relax servo margin to 90% no-load at 7.4 V (2S nominal)
+if os.environ.get("SCR_STAGE") in ("F", "G", "H", "I", "J"):   # 11-27 user: push 1 m/s -> relax servo margin to 90% no-load at 7.4 V (2S nominal)
     V_LIM = 0.9 * 7.4 / _P["kt"]
 
 
@@ -28,6 +28,31 @@ def leg_overspeed(env):
 
 
 STAGE = os.environ.get("SCR_STAGE", "A")
+
+
+def _patch_syncs():
+    """11-27 speed: CircularBuffer.append did torch.any() every physics step (host-GPU sync, 24% of py-spy samples).
+    Same result without the sync: masked backfill via torch.where."""
+    import torch
+    from mjlab.utils.buffers import circular_buffer as cb
+
+    def append(self, data):
+        if data.shape[0] != self._batch_size:
+            raise ValueError(f"Expected batch size {self._batch_size}, got {data.shape[0]}")
+        data = data.to(self._device)
+        if self._buffer is None:
+            self._pointer = -1
+            self._buffer = torch.empty((self._max_len, *data.shape), dtype=data.dtype, device=self._device)
+        self._pointer = (self._pointer + 1) % self._max_len
+        self._buffer[self._pointer] = data
+        first = (self._num_pushes == 0).view(1, -1, *([1] * (data.dim() - 1)))
+        self._buffer.copy_(torch.where(first, data.unsqueeze(0), self._buffer))
+        self._num_pushes += 1
+    cb.CircularBuffer.append = append
+
+
+if os.environ.get("SYNCFIX"):
+    _patch_syncs()
 
 
 def lin_progress(env):
@@ -75,9 +100,22 @@ def apply_scratch(cfg):
     Stage B (resume from A): +-1.0, std 0.35, swing 0.15-0.5 s, hip stride x1.8 (gait0.7 recipe)."""
     from mjlab.managers import RewardTermCfg
     cfg = apply_real(cfg)
+    if os.environ.get("CARPET"):   # 11-28 user: duck walks on carpet. Soft foot contact (head_carpet_sweep.py) + friction 0.6-1.0
+        rc = cfg.scene.entities["robot"]; orig = rc.spec_fn
+        def spec_fn():
+            spec = orig()
+            for g in spec.geoms:
+                if "foot" in g.name.lower():
+                    g.priority, g.solref, g.solimp = 5, (0.05, 1.0), (0.6, 0.9, 0.006, 0.5, 2.0)
+            return spec
+        rc.spec_fn = spec_fn
+        cfg.events["foot_friction"].params["ranges"] = (0.6, 1.0)
+    if os.environ.get("SIM_ITERS"):   # 11-27 speed bench: solver iteration overrides
+        cfg.sim.mujoco.iterations = int(os.environ["SIM_ITERS"])
+        cfg.sim.mujoco.ls_iterations = int(os.environ.get("SIM_LS", cfg.sim.mujoco.ls_iterations))
     r = cfg.rewards
     r["leg_overspeed"] = RewardTermCfg(func=leg_overspeed, weight=-0.5)
-    hip = 1.3 if STAGE == "A" else (2.3 if STAGE in ("F", "G", "H") else 1.8)
+    hip = 1.3 if STAGE == "A" else (2.3 if STAGE in ("F", "G", "H", "I", "J") else 1.8)
     seen = set()
     for key in ("std_walking", "std_running"):
         st = r["pose"].params.get(key)
@@ -87,7 +125,7 @@ def apply_scratch(cfg):
                 if "hip_pitch" in j: st[j] *= hip
     c = cfg.commands["twist"]
     r["lin_progress"] = RewardTermCfg(func=lin_progress, weight=1.0 if STAGE == "A" else 3.0)
-    if STAGE in ("B", "C", "D", "E", "F", "G", "H"):
+    if STAGE in ("B", "C", "D", "E", "F", "G", "H", "I", "J"):
         r["track_linear_velocity"].weight = 6.0
         r["track_linear_velocity"].params["std"] = 0.35
         r["track_angular_velocity"].weight = 5.0
@@ -126,6 +164,29 @@ def apply_scratch(cfg):
         r["air_time"].params["threshold_min"] = 0.08
         r["air_time"].params["threshold_max"] = 0.22
         r["cadence"] = RewardTermCfg(func=cadence, weight=15.0)
+    if STAGE in ("I", "J"):   # 11-27 user: keep H (fast cadence), only reach 1 m/s, posture does not matter, must not fall.
+        # Resume H. H terms + all posture/style terms off; stronger forward progress; upright + termination kept (anti-fall).
+        r["yaw_progress"] = RewardTermCfg(func=yaw_progress, weight=2.5)
+        r["track_angular_velocity"].weight = 6.0
+        r["track_angular_velocity"].params["std"] = 0.8
+        r["leg_overspeed"].weight = 0.0
+        r["lin_progress"].weight = 8.0
+        r["track_linear_velocity"].weight = 8.0
+        r["track_linear_velocity"].params["std"] = 0.3
+        r["air_time"].params["threshold_min"] = 0.08
+        r["air_time"].params["threshold_max"] = 0.30
+        r["cadence"] = RewardTermCfg(func=cadence, weight=8.0)
+        for k in ("pose", "head_pose_tracking", "head_pose_bias", "hip_yaw_home", "body_pose_tracking",
+                  "foot_clearance", "foot_swing_height", "body_ang_vel", "angular_momentum"):
+            if k in r: r[k].weight = 0.0
+    if STAGE == "J":   # 11-28 I reached 0.74 m/s at cmd 1.0 but fell 8-10% at 0.7-1.2; user: must not fall.
+        # Resume I, same terms + explicit fall penalty (non-timeout termination).
+        from mjlab.envs.mdp.rewards import is_terminated
+        r["fall_penalty"] = RewardTermCfg(func=is_terminated, weight=-5000.0 if os.environ.get("FALLK") else -200.0)
+        if os.environ.get("FALLL"):   # 11-28 L: K (-5000) collapsed to ~0.2 m/s + spinning; middle value + 10x slip penalty
+            r["fall_penalty"].weight = -1000.0
+            r["foot_slip"].weight = -1.0
+        # 11-28 K: -200 x dt(0.02) = only -4 per fall, J still fell 6-17% at 0.7-1.2 -> K uses -5000 (-100 per fall)
     if STAGE == "G":   # 11-27 user picked "change gait": F's air_time window (to 0.6 s) paid for slow long swings.
         # Resume from E; short swing window + touchdown cadence reward + F's stride/progress/overspeed relaxations.
         r["yaw_progress"] = RewardTermCfg(func=yaw_progress, weight=2.5)
@@ -147,9 +208,11 @@ def apply_scratch(cfg):
         if STAGE == "B":
             c.ranges.ang_vel_z = (-2.5, 2.5)
             c.rel_turn_in_place_envs = 0.1
-        if STAGE in ("F", "G", "H"):
+        if STAGE in ("F", "G", "H", "I", "J"):
             c.ranges.lin_vel_x = (-1.0, 1.2)
-        if STAGE in ("C", "D", "E", "F", "G", "H"):
+        if STAGE in ("I", "J"):   # Molly 11-27: target is 1 m/s both forward and backward
+            c.ranges.lin_vel_x = (-1.2, 1.2)
+        if STAGE in ("C", "D", "E", "F", "G", "H", "I", "J"):
             c.ranges.ang_vel_z = (-1.5, 1.5)
             c.rel_turn_in_place_envs = 0.25
     return cfg

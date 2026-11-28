@@ -28,6 +28,19 @@ def run(path):
     cfg = apply_real(load_env_cfg(BASE_TASK, play=True), vin=tuple(float(x) for x in os.environ.get("ACC_VIN", "7.3,7.7").split(",")),
                      vin_min=6.9, drop=tuple(float(x) for x in os.environ.get("ACC_DROP", ".05,.2").split(",")),
                      max_lag=int(os.environ.get("ACC_LAG", "8")), train=True)
+    if os.environ.get("SIM_ITERS"):   # 11-27 speed: check solver-iteration change does not change results
+        cfg.sim.mujoco.iterations = int(os.environ["SIM_ITERS"]); cfg.sim.mujoco.ls_iterations = int(os.environ.get("SIM_LS", 10))
+    if os.environ.get("ACC_FRIC"):   # 11-28: falls vs floor friction (training randomizes 0.2-0.8)
+        cfg.events["foot_friction"].params["ranges"] = tuple(float(x) for x in os.environ["ACC_FRIC"].split(","))
+    if os.environ.get("ACC_CARPET"):   # 11-28 user: duck walks on carpet -> soft foot contact (head_carpet_sweep.py model)
+        rc = cfg.scene.entities["robot"]; orig = rc.spec_fn
+        def spec_fn():
+            spec = orig()
+            for g in spec.geoms:
+                if "foot" in g.name.lower():
+                    g.priority, g.solref, g.solimp = 5, (0.05, 1.0), (0.6, 0.9, 0.006, 0.5, 2.0)
+            return spec
+        rc.spec_fn = spec_fn
     cfg.events.pop("sudden_brake", None)  # this test applies the brake itself, at a known time
     cfg.scene.num_envs, cfg.episode_length_s, cfg.seed = n, 30, 7
     c = cfg.commands["twist"]
